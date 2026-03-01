@@ -1,0 +1,83 @@
+---
+- name: Provision local generative AI pipeline environment
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+    # Use standard conventions for vars
+    python_version: "3.10"
+
+  tasks:
+    - name: Ensure standard directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - ./workspace
+        - ./output
+
+    - name: Check if FFmpeg is installed (MacOS)
+      command: brew list ffmpeg
+      register: brew_ffmpeg_check
+      ignore_errors: true
+      when: ansible_os_family == 'Darwin'
+
+    - name: Install FFmpeg via Homebrew (MacOS)
+      homebrew:
+        name: ffmpeg
+        state: present
+      when: ansible_os_family == 'Darwin' and brew_ffmpeg_check.failed
+
+    - name: Ensure FFmpeg is installed (Debian/Ubuntu)
+      apt:
+        name: ffmpeg
+        state: present
+        update_cache: yes
+      become: yes
+      when: ansible_os_family == 'Debian'
+
+    - name: Create Python virtual environment
+      pip:
+        requirements: requirements.txt
+        virtualenv: ./venv
+        virtualenv_command: python3 -m venv
+
+    - name: Check if Ollama is installed (MacOS / Linux)
+      command: command -v ollama
+      register: ollama_installed
+      ignore_errors: true
+      changed_when: false
+
+    - name: Download and Install Ollama (MacOS)
+      shell: "curl -L https://ollama.com/download/Ollama-darwin.zip -o Ollama-darwin.zip && unzip Ollama-darwin.zip -d /Applications && rm Ollama-darwin.zip"
+      when: ansible_os_family == 'Darwin' and ollama_installed.rc != 0
+      
+    - name: Download and Install Ollama (Linux)
+      shell: "curl -fsSL https://ollama.com/install.sh | sh"
+      when: ansible_os_family == 'Debian' and ollama_installed.rc != 0
+
+    - name: Start Ollama service (Linux)
+      systemd:
+        name: ollama
+        state: started
+        enabled: yes
+      become: yes
+      when: ansible_os_family == 'Debian'
+      ignore_errors: true
+
+    - name: Pull Qwen 2.5 7B Instruct Model via Ollama
+      command: ollama pull qwen2.5:7b-instruct
+      when: (ansible_os_family == 'Darwin' or ansible_os_family == 'Debian')
+      # Note: We rely on the user running Ollama locally prior to execution on macOS
+      ignore_errors: true
+
+    - name: Ensure .env config from template exists
+      copy:
+        src: .env.example
+        dest: .env
+        force: no
+
+    - name: Display Setup Success Message
+      debug:
+        msg: "Pipeline environment successfully provisioned. Be sure to check .env settings."

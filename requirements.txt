@@ -1,3 +1,6 @@
 faster-whisper
 srt
 requests
+python-dotenv
+langgraph
+grandalf

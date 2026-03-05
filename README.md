@@ -1,100 +1,202 @@
-# Weekend Project: Nihongo-SRT: AI Japanese Learner's Subtitle Pipeline
+# Nihongo-SRT: AI Japanese Subtitle Pipeline
 
-An end-to-end multi-platform AI pipeline that extracts Japanese audio from videos, transcribes native speech, translates it to Traditional Chinese using local open-weight large language models, and generates dual-language bilingual subtitles.
+An end-to-end, multi-platform AI pipeline that extracts Japanese audio from video, transcribes native speech with Whisper, translates to Traditional Chinese with a local LLM, and generates synchronized bilingual `.srt` subtitle files.
 
-This repository was purpose-built to **facilitate Japanese language learning** by creating high-quality, synchronized bilingual subtitles (Japanese + Chinese) for raw anime, dramas, or learning materials.
+Built as a Japanese language learning tool — and as a hands-on playground for **LangGraph**, **MLX**, and **local LLM inference**.
 
-## 🚀 Architecture for MLOps & DevOps
+---
+
+## 🏗 Architecture
 
 ```mermaid
 flowchart TD
-    A[Raw Video/Audio] -->|FFmpeg| B(Extract Audio .mp3)
-    B --> C{Platform Detection}
-    
-    C -->|Windows/CUDA| D[Faster-Whisper Subsystem]
-    C -->|macOS/Apple Silicon| E[MLX-Whisper Subsystem]
-    
-    D -->|Cache Transcripts| F[(JSON Segment Cache)]
-    E -->|Cache Transcripts| F
-    
-    F -->|Batch Processing| G{LLM Translation Agent}
-    G -->|Ollama qwen2.5| H[CUDA GPU Inference]
-    G -->|mlx_lm Qwen2.5| I[Apple Neural Engine/GPU Inference]
-    
-    H -->|Sync Timestamps| J[Subtitle Synthesizer]
-    I -->|Sync Timestamps| J
-    
-    J --> K[.jp.srt]
-    J --> L[.cn.srt]
-    J --> M[Bilingual .srt]
-    
-    style A fill:#f9f,stroke:#333,stroke-width:2px
-    style F fill:#f96,stroke:#333,stroke-width:2px
-    style M fill:#6f9,stroke:#333,stroke-width:2px
+    A[Raw Video / Audio] -->|FFmpeg| B(Extract .mp3)
+    B --> C{Platform}
+
+    C -->|Windows · CUDA| D[Faster-Whisper\nsubprocess]
+    C -->|macOS · Apple Silicon| E[MLX-Whisper]
+
+    D -->|segments.json| F[(Segment Cache)]
+    E -->|segments.json| F
+
+    F -->|Batch translate| G{LLM}
+    G -->|Ollama / Qwen2.5| H[CUDA Inference]
+    G -->|mlx_lm / Qwen2.5| I[Apple Neural Engine]
+
+    H --> J[Subtitle Synthesizer]
+    I --> J
+
+    J --> K[episode.jp.srt]
+    J --> L[episode.cn.srt]
+    J --> M[episode.srt  ·  bilingual]
+
+    style A fill:#f9f,stroke:#333
+    style F fill:#f96,stroke:#333
+    style M fill:#6f9,stroke:#333
 ```
 
-This pipeline is designed with **MLOps best practices** in mind, offering resilience, observability, and infrastructure-as-code capabilities.
+---
 
-*   **Dual-Platform Support**: Features discrete pipelines built for Nvidia CUDA (`pipeline_cuda.py`) using `faster-whisper` and Ollama, and Apple Silicon (`pipeline_mlx.py`) using Apple's MLX engine for optimized inference.
-*   **Pipeline Resilience**: Implements JSON-based checkpointing between the Transcription (Whisper) and Translation (LLM) agents. If the system crashes or halts, the pipeline resumes execution identically without wasting compute or re-running inferences.
-*   **Observability**: Integrated standard structured logging ensuring that execution progress, errors, and system states are monitored and formatted cleanly.
-*   **Infrastructure-as-Code**: Includes an Ansible `playbook.yml` to programmatically provision the local environment and a `Dockerfile` to containerize the CUDA inference dependencies. 
+## 📁 Repository Layout
+
+| File                         | Description                                                                             |
+| ---------------------------- | --------------------------------------------------------------------------------------- |
+| `nodes.py`                   | **Shared LangGraph node definitions** — `PipelineState`, all 4 nodes, backend injection |
+| `pipeline_langgraph_cuda.py` | ⭐ **LangGraph entrypoint (CUDA/Windows)** — Whisper in subprocess, Ollama translate     |
+| `pipeline_langgraph_mlx.py`  | ⭐ **LangGraph entrypoint (MLX/macOS)** — MLX Whisper + Qwen2.5 translate                |
+| `pipeline_cuda.py`           | Legacy CUDA pipeline (single-script, no LangGraph)                                      |
+| `pipeline_mlx.py`            | Legacy MLX pipeline (single-script, no LangGraph)                                       |
+| `requirements.txt`           | Python dependencies                                                                     |
+| `.env.example`               | Environment variable template                                                           |
+| `playbook.yml`               | Ansible provisioning playbook                                                           |
+| `Dockerfile`                 | Docker image for CUDA inference                                                         |
+
+> **Recommended**: Use the `pipeline_langgraph_*.py` entrypoints — they are more resilient and support retry logic.
+
+---
+
+## 🔄 LangGraph Pipeline
+
+The LangGraph pipeline represents the nodes as a linear `StateGraph`:
+
+```
+__start__
+    ↓
+extract_audio   ← FFmpeg; skips if .mp3 already exists
+    ↓
+transcribe      ← Whisper; skips if .segments.json cache valid
+    ↓
+translate       ← LLM batch translation; checkpoints per batch
+    ↓
+write_srt       ← Writes .jp.srt / .cn.srt / bilingual .srt
+    ↓
+__end__
+```
+
+**Key design decisions:**
+
+- **Whisper runs in a subprocess** (CUDA only) — when the process exits, the OS frees all VRAM cleanly. This completely avoids the CTranslate2 destructor crash that occurs when Ollama holds a concurrent CUDA context.
+- **Segment cache is written atomically** inside the Whisper function — a crash between Whisper and translation no longer loses the transcript.
+- **Recursive batch-halving retry** — on an Ollama batch mismatch, the failing batch is split in half and retried recursively (O(log n)) before falling back to single-line translation.
+- **LangGraph `RetryPolicy`** on the translate node — handles Ollama HTTP connection drops automatically (up to 3 retries with backoff).
+
+---
 
 ## 🛠 Prerequisites
 
-*   **System Dependencies**: FFmpeg must be installed and in your system PATH.
-*   **Python**: Python 3.10+ isolated in a virtual environment.
-*   **LLM Backend**: 
-    *   *Windows/Linux*: [Ollama](https://ollama.com/) must be installed and running. Pull the required models (`ollama pull qwen2.5:7b-instruct`).
-    *   *macOS*: Models are loaded dynamically via Hugging Face using `mlx_lm`.
+| Dependency                                  | Purpose                           |
+| ------------------------------------------- | --------------------------------- |
+| [FFmpeg](https://ffmpeg.org/)               | Audio extraction                  |
+| Python 3.10+                                | Runtime                           |
+| [Ollama](https://ollama.com/) *(CUDA only)* | LLM inference server              |
+| NVIDIA GPU *(CUDA only)*                    | Faster-Whisper + Ollama inference |
+| Apple Silicon Mac *(MLX only)*              | MLX Whisper + Qwen2.5 inference   |
 
-## 📦 Setup & Installation
+---
 
-1.  **Clone the Repository**:
-    ```bash
-    git clone <your-repo-url>
-    cd llm_srt
-    ```
-2.  **Environment Variables**:
-    Copy the sample configuration file and customize it.
-    ```bash
-    cp .env.example .env
-    ```
-3.  **Install Python Requirements**:
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate  # On Windows: venv\Scripts\activate
-    pip install -r requirements.txt
-    ```
+## 📦 Installation
 
-### Alternatively: Provision via Ansible
+```bash
+git clone https://github.com/hwong5208/LLM_Benkyo_Nihongo_SRT.git
+cd LLM_Benkyo_Nihongo_SRT
+
+# Create virtualenv
+python -m venv venv
+source venv/bin/activate          # macOS/Linux
+# venv\Scripts\activate           # Windows
+
+pip install -r requirements.txt
+
+# Copy and configure environment
+cp .env.example .env
+```
+
+### Alternative: Provision via Ansible
 ```bash
 ansible-playbook playbook.yml
 ```
 
-### Alternatively: Run via Docker (CUDA Only)
+### Alternative: Docker (CUDA only)
 ```bash
-docker build -t generative_translator .
-docker run --gpus all -v /path/to/local/media:/data generative_translator --input /data/video.mp4 --output-dir /data/output
+docker build -t nihongo-srt .
+docker run --gpus all \
+  -v /path/to/media:/data \
+  nihongo-srt --input /data/video.mp4 --output-dir /data/output
 ```
 
-## 🧠 Usage
+---
 
-Run the pipeline targeting either a `.mp4` video or `.mp3` audio file.
+## ⚙️ Configuration (`.env`)
 
-**For NVIDIA CUDA Machines:**
-```bash
-python pipeline_cuda.py --input sample_video.mp4 --output-dir ./results
+```ini
+# Shared
+WORKSPACE_DIR=./workspace          # Scratch dir for audio + cache files
+
+# CUDA / Windows
+OLLAMA_API_URL=http://localhost:11434/api/generate
+OLLAMA_MODEL=qwen2.5:7b-instruct
+OLLAMA_BATCH_SIZE=25
+WHISPER_MODEL_SIZE=medium
+WHISPER_DEVICE=cuda
+WHISPER_COMPUTE_TYPE=float16
+
+# MLX / macOS
+MLX_WHISPER_MODEL=mlx-community/whisper-large-v3-turbo
+MLX_LLM_MODEL=mlx-community/Qwen2.5-7B-Instruct-4bit
+MLX_BATCH_SIZE=20
 ```
 
-**For Apple Silicon (M-Series) Machines:**
+---
+
+## 🚀 Usage
+
+**CUDA / Windows (LangGraph — recommended):**
 ```bash
-python pipeline_mlx.py --input sample_video.mp4 --output-dir ./results
+# Make sure Ollama is running first
+ollama serve
+ollama pull qwen2.5:7b-instruct
+
+python pipeline_langgraph_cuda.py --input video.mp4 --output-dir ./output
 ```
 
-## ⚙️ How It Works (Pipeline Overview)
+**MLX / macOS (LangGraph — recommended):**
+```bash
+python pipeline_langgraph_mlx.py --input video.mp4 --output-dir ./output
+```
 
-1.  **Extraction**: Audio is stripped from the video using lightweight FFmpeg pass to save I/O overhead.
-2.  **Transcription (Agent 1)**: The Whisper speech-to-text model generates raw, natively timed Japanese text segments. Output is cached securely to disk.
-3.  **Translation (Agent 2)**: The Qwen language model receives batched queries translating the Japanese to Traditional Chinese. Utilizing batches minimizes sequence overhead. Output is continuously checkpointed.
-4.  **Generation**: Synchronized dual-language `.srt` files are synthesized and saved to the target directory.
+**Resume** — re-run the same command. The pipeline automatically skips completed stages:
+- Audio already extracted → skip FFmpeg
+- Segments cache exists and valid → skip Whisper
+- Translation cache exists → skip already-translated batches
+
+**Print graph topology only:**
+```bash
+python pipeline_langgraph_cuda.py --input video.mp4 --print-graph
+```
+
+---
+
+## 📤 Output Files
+
+For an input `episode01.mp4`, the pipeline produces:
+
+| File               | Contents                        |
+| ------------------ | ------------------------------- |
+| `episode01.jp.srt` | Japanese-only subtitles         |
+| `episode01.cn.srt` | Traditional Chinese subtitles   |
+| `episode01.srt`    | Bilingual (JP + CN on each cue) |
+
+---
+
+## 🔬 How It Works
+
+1. **Extract** — FFmpeg strips audio to 16kHz mono `.mp3` into `./workspace`.
+2. **Transcribe** — Whisper generates natively-timed Japanese segments, saved as `.segments.json`.
+3. **Translate** — Qwen2.5 receives batched Japanese lines and returns Traditional Chinese. Each batch is checkpointed to `.trans_cache.json` — safe to interrupt and resume.
+4. **Synthesize** — Timestamps and translated text are assembled into `.srt` files.
+
+---
+
+## 📜 License
+
+This project is for personal and educational use.

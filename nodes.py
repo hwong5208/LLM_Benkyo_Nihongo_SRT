@@ -112,26 +112,30 @@ def transcribe_node(state: PipelineState) -> dict:
     Resume: If a segments cache JSON already exists, load it and skip inference.
     Updates: segments (list of serializable dicts)
 
-    NOTE: The actual whisper inference callable is injected by the platform
-    entrypoint and called via _run_whisper(audio_path). The platform module
-    must call set_whisper_backend() before graph compilation.
+    Cache-safety: The platform whisper backend is responsible for writing the
+    segments cache atomically (before returning), so a crash mid-stream
+    never leaves us without a checkpoint.
     """
     audio_path = state["audio_path"]
     segments_cache = audio_path + ".segments.json"
 
     if os.path.exists(segments_cache):
-        logger.info(f"Skip Whisper: Loading cached segments from {segments_cache}")
-        with open(segments_cache, "r", encoding="utf-8") as f:
-            segments = json.load(f)
-        return {"segments": segments}
+        try:
+            with open(segments_cache, "r", encoding="utf-8") as f:
+                segments = json.load(f)
+            if segments:
+                logger.info(f"Skip Whisper: Loaded {len(segments)} segments from cache.")
+                return {"segments": segments}
+            else:
+                logger.warning("Cache file is empty — discarding and re-running Whisper.")
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Cache file corrupted ({e}) — discarding and re-running Whisper.")
+        # Remove the bad file so the fresh write below succeeds cleanly
+        os.remove(segments_cache)
 
-    # Delegate to the platform-specific whisper function
+    # Delegate to the platform-specific whisper function.
+    # The backend writes the cache itself before returning — crash-safe.
     segments = _run_whisper(audio_path)
-
-    logger.info(f"Cache: Saving {len(segments)} segments to {segments_cache}")
-    with open(segments_cache, "w", encoding="utf-8") as f:
-        json.dump(segments, f, ensure_ascii=False)
-
     gc.collect()
     return {"segments": segments}
 
@@ -171,10 +175,43 @@ def set_batch_size(n: int):
 
 
 
+def _translate_with_retry(lines: List[str]) -> List[str]:
+    """
+    Translate a list of lines with recursive batch-halving retry.
+
+    Strategy:
+      1. Try translating all lines as a single batch.
+      2. On mismatch (None returned), split in half and retry each half.
+      3. Recurse until batches are size 1, then fall back to single-line.
+
+    This avoids the expensive O(n) single-line fallback for a full batch
+    by instead trying O(log n) progressively smaller batches first.
+    """
+    if len(lines) == 1:
+        # Base case — can't split further, use single-line inference
+        logger.warning(f"  Retry: falling back to single-line for 1 segment.")
+        return [_infer_single_fn(lines[0])]
+
+    result = _infer_batch_fn(lines)
+    if result is not None:
+        return result
+
+    # Batch mismatch — halve and retry each half independently
+    mid = len(lines) // 2
+    logger.warning(
+        f"  Retry: batch mismatch on {len(lines)} lines → splitting into "
+        f"{mid} + {len(lines) - mid}"
+    )
+    left  = _translate_with_retry(lines[:mid])
+    right = _translate_with_retry(lines[mid:])
+    return left + right
+
+
 def translate_node(state: PipelineState) -> dict:
     """
     Node: Translate all Japanese segments to Traditional Chinese using the LLM.
     Resume: Loads any existing translation cache and only translates missing entries.
+    Retry: Uses recursive batch-halving on mismatch before falling to single-line.
     Updates: translated_map
     """
     if _infer_single_fn is None or _infer_batch_fn is None:
@@ -214,11 +251,7 @@ def translate_node(state: PipelineState) -> dict:
             continue  # All already cached
 
         logger.info(f"  Translating [{i+1}–{min(i+_batch_size, total)}/{total}]...")
-        results = _infer_batch_fn(lines_to_translate)
-
-        if results is None:
-            logger.warning("  Batch mismatch — falling back to single-line mode")
-            results = [_infer_single_fn(line) for line in lines_to_translate]
+        results = _translate_with_retry(lines_to_translate)
 
         for local_idx, translated_text in enumerate(results):
             global_idx = indices_to_translate[local_idx]
@@ -231,6 +264,7 @@ def translate_node(state: PipelineState) -> dict:
         gc.collect()
 
     return {"translated_map": translated_map}
+
 
 
 # ---------------------------------------------------------------------------

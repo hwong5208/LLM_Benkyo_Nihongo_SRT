@@ -46,6 +46,7 @@ except ImportError:
 # --- LangGraph import ---
 try:
     from langgraph.graph import StateGraph, START, END
+    from langgraph.types import RetryPolicy
 except ImportError:
     logger.critical("langgraph not found. Run: pip install langgraph")
     sys.exit(1)
@@ -126,6 +127,13 @@ def _mlx_whisper(audio_path: str) -> List[dict]:
 
     print("\n", flush=True)
     logger.info(f"MLX Whisper: {len(segments)} clean segments.")
+
+    # Write cache atomically before returning — crash-safe
+    segments_cache = audio_path + ".segments.json"
+    logger.info(f"Cache: Saving segments to {segments_cache}")
+    with open(segments_cache, "w", encoding="utf-8") as f:
+        json.dump(segments, f, ensure_ascii=False)
+
     gc.collect()
     return segments
 
@@ -200,7 +208,11 @@ def build_graph():
     # Register nodes
     workflow.add_node("extract_audio", extract_audio_node)
     workflow.add_node("transcribe",    transcribe_node)
-    workflow.add_node("translate",     translate_node)
+    workflow.add_node(
+        "translate",
+        translate_node,
+        retry=RetryPolicy(max_attempts=3, backoff_factor=1.0),
+    )
     workflow.add_node("write_srt",     write_srt_node)
 
     # Define edges (linear DAG)

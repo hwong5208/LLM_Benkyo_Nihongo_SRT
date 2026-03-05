@@ -15,26 +15,32 @@ import os
 import sys
 import re
 import gc
+import json
 import time
 import logging
 import argparse
+import subprocess
 from datetime import timedelta
 from typing import List, Optional
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
+# Silence noisy internal debug loggers — only show our own DEBUG lines
+for _noisy in ("httpcore", "httpx", "urllib3", "faster_whisper", "ctranslate2"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 # --- CUDA / Faster-Whisper imports ---
+# NOTE: WhisperModel is imported inside _whisper_worker() (subprocess) only.
 try:
-    from faster_whisper import WhisperModel
     import requests
 except ImportError:
-    logger.critical("Dependencies not found. Run: pip install faster-whisper requests")
+    logger.critical("Dependencies not found. Run: pip install requests")
     sys.exit(1)
 
 try:
@@ -46,6 +52,7 @@ except ImportError:
 # --- LangGraph import ---
 try:
     from langgraph.graph import StateGraph, START, END
+    from langgraph.types import RetryPolicy
 except ImportError:
     logger.critical("langgraph not found. Run: pip install langgraph")
     sys.exit(1)
@@ -107,14 +114,57 @@ def check_dependencies() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# CUDA Whisper backend (Faster-Whisper)
+# CUDA Whisper backend (Faster-Whisper) — runs in a SUBPROCESS
+# ---------------------------------------------------------------------------
+# Running Whisper in a child process completely solves the CUDA destructor
+# crash: when the subprocess exits, the OS reclaims ALL GPU memory instantly.
+# No Python destructor, no ctranslate2 double-free, no segfault.
 # ---------------------------------------------------------------------------
 
-def _cuda_whisper(audio_path: str) -> List[dict]:
-    """Run Faster-Whisper on CUDA, return list of segment dicts."""
-    logger.info(f"Faster-Whisper: Loading {WHISPER_MODEL_SIZE} on {WHISPER_DEVICE} ({WHISPER_COMPUTE_TYPE})...")
-    model = WhisperModel(WHISPER_MODEL_SIZE, device=WHISPER_DEVICE,
-                         compute_type=WHISPER_COMPUTE_TYPE)
+import multiprocessing
+
+
+def _log_vram(label: str):
+    """Log current CUDA VRAM via nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.free,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        used, free, total = [int(x.strip()) for x in result.stdout.strip().split(",")]
+        logger.debug(
+            f"[VRAM] {label}: "
+            f"used={used}MB | free={free}MB | total={total}MB"
+        )
+    except Exception as e:
+        logger.debug(f"[VRAM] {label}: nvidia-smi unavailable ({e})")
+
+
+def _whisper_worker(audio_path, model_size, device, compute_type, segments_cache_path):
+    """
+    Whisper transcription worker — runs in a child process.
+
+    Loads the model, transcribes, saves segments to disk, then exits.
+    When this process exits, the OS frees ALL CUDA memory — no destructor needed.
+    """
+    # Self-contained imports so the child process is independent
+    import json
+    import sys
+    import logging
+
+    from faster_whisper import WhisperModel
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger("whisper_worker")
+
+    log.info(f"Faster-Whisper: Loading {model_size} on {device} ({compute_type})...")
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
     segments_iter, info = model.transcribe(
         audio_path,
@@ -125,7 +175,7 @@ def _cuda_whisper(audio_path: str) -> List[dict]:
         log_prob_threshold=-1.0,
         compression_ratio_threshold=2.4,
     )
-    logger.info(f"Detected language: {info.language} ({info.language_probability:.2f})")
+    log.info(f"Detected language: {info.language} ({info.language_probability:.2f})")
 
     segments = []
     seen_text = None
@@ -148,14 +198,57 @@ def _cuda_whisper(audio_path: str) -> List[dict]:
         print(".", end="", flush=True)
 
     print("\n", flush=True)
-    logger.info(f"Faster-Whisper: {len(segments)} clean segments.")
+    log.info(f"Faster-Whisper: {len(segments)} clean segments.")
 
-    # Free VRAM
-    del model
-    gc.collect()
-    time.sleep(2)
+    # Write cache — the main process reads this after we exit
+    log.info(f"Cache: Saving {len(segments)} segments to {segments_cache_path}")
+    with open(segments_cache_path, "w", encoding="utf-8") as f:
+        json.dump(segments, f, ensure_ascii=False)
 
+    # Process exits here → OS frees ALL CUDA memory. No destructor needed.
+
+
+def _cuda_whisper(audio_path: str) -> List[dict]:
+    """
+    Launch Whisper in a subprocess, wait for it, read segments from cache.
+    VRAM is freed automatically when the child process exits.
+    """
+    segments_cache = audio_path + ".segments.json"
+
+    _log_vram("before Whisper subprocess")
+
+    p = multiprocessing.Process(
+        target=_whisper_worker,
+        args=(audio_path, WHISPER_MODEL_SIZE, WHISPER_DEVICE,
+              WHISPER_COMPUTE_TYPE, segments_cache),
+    )
+    p.start()
+    p.join()
+
+    _log_vram("after Whisper subprocess exited (VRAM should be freed)")
+
+    # The subprocess may exit with a non-zero code due to ctranslate2's
+    # native destructor segfaulting during Python exit cleanup (0xC0000409
+    # on Windows). This is harmless — the work is done and the cache file
+    # is already on disk. Only raise if the cache file is missing/empty.
+    if not os.path.exists(segments_cache) or os.path.getsize(segments_cache) == 0:
+        raise RuntimeError(
+            f"Whisper subprocess failed (exit code {p.exitcode}). "
+            f"No segments cache produced."
+        )
+
+    if p.exitcode != 0:
+        logger.warning(
+            f"Whisper subprocess exited with code {p.exitcode} "
+            f"(likely ctranslate2 destructor crash — harmless, data saved)."
+        )
+
+    with open(segments_cache, "r", encoding="utf-8") as f:
+        segments = json.load(f)
+
+    logger.info(f"Whisper subprocess complete: {len(segments)} segments loaded from cache.")
     return segments
+
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +280,13 @@ def _ollama_infer_batch(lines: List[str]) -> Optional[List[str]]:
         f"(Taiwan/Hong Kong style). Output ONLY the translated lines as a numbered list "
         f"(1., 2., etc.). Do not explain.\n\n{prompt_text}\nOutput:"
     )
+    t0 = time.time()
     try:
         resp = requests.post(OLLAMA_API_URL, json={
             "model": OLLAMA_MODEL, "prompt": prompt, "stream": False
         })
         resp.raise_for_status()
+        elapsed = time.time() - t0
         result = resp.json().get("response", "").strip()
 
         translated = []
@@ -205,9 +300,19 @@ def _ollama_infer_batch(lines: List[str]) -> Optional[List[str]]:
                 translated.append(match.group(2).strip())
                 current_idx += 1
 
-        return translated if len(translated) == len(lines) else None
+        if len(translated) != len(lines):
+            logger.debug(
+                f"[MISMATCH] elapsed={elapsed:.1f}s | "
+                f"expected={len(lines)} got={len(translated)} | "
+                f"raw_response_preview={repr(result[:400])}"
+            )
+            return None
+
+        logger.debug(f"[BATCH OK] {len(lines)} lines in {elapsed:.1f}s")
+        return translated
     except Exception as e:
-        logger.error(f"Batch inference error: {e}")
+        elapsed = time.time() - t0
+        logger.error(f"Batch inference error after {elapsed:.1f}s: {e}")
         return None
 
 
@@ -226,7 +331,11 @@ def build_graph():
 
     workflow.add_node("extract_audio", extract_audio_node)
     workflow.add_node("transcribe",    transcribe_node)
-    workflow.add_node("translate",     translate_node)
+    workflow.add_node(
+        "translate",
+        translate_node,
+        retry=RetryPolicy(max_attempts=3, backoff_factor=1.0),
+    )
     workflow.add_node("write_srt",     write_srt_node)
 
     workflow.add_edge(START,           "extract_audio")
